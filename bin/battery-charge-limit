@@ -1,0 +1,267 @@
+#!/bin/bash
+# Apply a 60 / 80 / 100% charge limit on any laptop whose kernel exposes it.
+# Writes the standard power_supply thresholds, and a few vendor fallbacks
+# when that attribute does not exist. Root-only writes; other callers re-exec
+# through pkexec.
+set -euo pipefail
+
+STATE=/var/lib/omarchy/battery-charge-limit
+SYS_ROOT=${BATTERY_CHARGE_SYS:-/sys/class/power_supply}
+PLATFORM_ROOT=${BATTERY_CHARGE_PLATFORM:-/sys/devices/platform}
+IDEAPAD_ROOT=${BATTERY_CHARGE_IDEAPAD:-/sys/bus/platform/drivers/ideapad_acpi}
+
+valid() { [[ ${1:-} == 60 || ${1:-} == 80 || ${1:-} == 100 ]]; }
+
+read_num() {
+  local path="$1" value=""
+  [[ -r $path ]] || return 1
+  value=$(tr -d '[:space:]' <"$path" 2>/dev/null || true)
+  [[ $value =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+write_exact() {
+  local path="$1" value="$2" actual=""
+  [[ -e $path ]] || return 1
+  printf '%s\n' "$value" >"$path" 2>/dev/null || return 1
+  actual=$(read_num "$path" 2>/dev/null || true)
+  [[ $actual == "$value" ]]
+}
+
+save_state() {
+  local limit="$1"
+  install -d -m 0755 /var/lib/omarchy
+  printf '%s\n' "$limit" >"$STATE"
+  chmod 0644 "$STATE"
+}
+
+# Prefer the stop value. If a start threshold exists, keep a small gap so
+# charging does not chatter, and move the start threshold out of the way
+# before lowering the stop value (ThinkPad and Dell reject start >= stop).
+# Dell and Wilco want start = stop - 5. Full charge is stop 100; start 0
+# means "off" on ThinkPad/Huawei/System76, and 95 is Dell's default.
+apply_supply() {
+  local dir="$1" limit="$2"
+  local end_path="" start_path="" end_target start_now
+  local start_try="" candidate applied=1
+
+  if [[ -e $dir/charge_control_end_threshold ]]; then
+    end_path=$dir/charge_control_end_threshold
+  elif [[ -e $dir/charge_stop_threshold ]]; then
+    end_path=$dir/charge_stop_threshold
+  else
+    return 1
+  fi
+
+  if [[ -e $dir/charge_control_start_threshold ]]; then
+    start_path=$dir/charge_control_start_threshold
+  elif [[ -e $dir/charge_start_threshold ]]; then
+    start_path=$dir/charge_start_threshold
+  fi
+
+  if [[ -e $dir/charge_type && -r $dir/charge_types ]] && grep -qw Custom "$dir/charge_types"; then
+    printf 'Custom\n' >"$dir/charge_type" 2>/dev/null || true
+  fi
+
+  end_target=$limit
+  if [[ -n $start_path ]]; then
+    start_now=$(read_num "$start_path" || echo 0)
+    if ((start_now >= end_target)); then
+      for candidate in 0 $((end_target > 5 ? end_target - 5 : 0)) 50; do
+        write_exact "$start_path" "$candidate" && break
+      done
+    fi
+  fi
+
+  write_exact "$end_path" "$end_target" || applied=0
+
+  if [[ -n $start_path && $applied -eq 1 ]]; then
+    if ((end_target >= 100)); then
+      for candidate in 0 95; do
+        write_exact "$start_path" "$candidate" && break
+      done
+    else
+      for candidate in $((end_target - 5)) $((end_target - 10)) 0; do
+        ((candidate >= 0 && candidate < end_target)) || continue
+        write_exact "$start_path" "$candidate" && break
+      done
+    fi
+  fi
+
+  if ((applied == 1)); then
+    return 0
+  fi
+  return 1
+}
+
+# Fixed-step vendor interfaces used when the standard attribute is absent.
+apply_vendor_fallback() {
+  local limit="$1" path value applied=1 found=0
+
+  path=$PLATFORM_ROOT/samsung/battery_life_extender
+  if [[ -e $path ]]; then
+    found=1
+    # 1 charges to 80%. There is no 60% step.
+    if [[ $limit == 100 ]]; then value=0; else value=1; fi
+    write_exact "$path" "$value" || applied=0
+  fi
+
+  path=$PLATFORM_ROOT/sony-laptop/battery_care_limiter
+  if [[ -e $path ]]; then
+    found=1
+    # Hardware steps are 50, 80 and 100. 60% is the nearest lower step, 50.
+    if [[ $limit == 100 ]]; then value=100
+    elif [[ $limit == 80 ]]; then value=80
+    else value=50
+    fi
+    write_exact "$path" "$value" || applied=0
+  fi
+
+  path=$PLATFORM_ROOT/lg-laptop/battery_care_limit
+  if [[ -e $path ]]; then
+    found=1
+    # Only 80 (on) or 100 (off). 60% uses the only available conservation step.
+    if [[ $limit == 100 ]]; then value=100; else value=80; fi
+    write_exact "$path" "$value" || applied=0
+  fi
+
+  path=$PLATFORM_ROOT/huawei-wmi/charge_control_thresholds
+  if [[ -e $path ]]; then
+    found=1
+    if [[ $limit == 100 ]]; then
+      printf '0 100\n' >"$path" 2>/dev/null || applied=0
+    else
+      printf '%s %s\n' "$((limit - 5))" "$limit" >"$path" 2>/dev/null || applied=0
+    fi
+  fi
+
+  local ideapad
+  shopt -s nullglob
+  for ideapad in "$IDEAPAD_ROOT"/*/conservation_mode; do
+    found=1
+    # conservation_mode is a fixed firmware limit, usually around 60%.
+    if [[ $limit == 100 ]]; then value=0; else value=1; fi
+    write_exact "$ideapad" "$value" || applied=0
+  done
+  shopt -u nullglob
+
+  ((found == 1)) || return 2
+  if ((applied == 1)); then
+    return 0
+  fi
+  return 1
+}
+
+has_standard_supply() {
+  local dir
+  shopt -s nullglob
+  for dir in "$SYS_ROOT"/*; do
+    if [[ -e $dir/charge_control_end_threshold || -e $dir/charge_stop_threshold ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+apply_limit() {
+  local limit="$1" dir applied=1 found=0
+  if has_standard_supply; then
+    shopt -s nullglob
+    for dir in "$SYS_ROOT"/*; do
+      if [[ -e $dir/charge_control_end_threshold || -e $dir/charge_stop_threshold ]]; then
+        found=1
+        apply_supply "$dir" "$limit" || applied=0
+      fi
+    done
+    shopt -u nullglob
+    ((found == 1)) || return 1
+    if ((applied == 1)); then
+      return 0
+    fi
+    return 1
+  fi
+  apply_vendor_fallback "$limit"
+}
+
+read_actual() {
+  local dir path value="" fallback=""
+  shopt -s nullglob
+  for dir in "$SYS_ROOT"/*; do
+    for path in "$dir/charge_control_end_threshold" "$dir/charge_stop_threshold"; do
+      value=$(read_num "$path" 2>/dev/null || true)
+      if [[ -n $value ]]; then
+        shopt -u nullglob
+        printf '%s\n' "$value"
+        return 0
+      fi
+    done
+  done
+  shopt -u nullglob
+
+  if [[ -e $PLATFORM_ROOT/samsung/battery_life_extender ]]; then
+    value=$(read_num "$PLATFORM_ROOT/samsung/battery_life_extender" || true)
+    if [[ $value == 1 ]]; then printf '80\n'; else printf '100\n'; fi
+    return 0
+  fi
+  if [[ -e $PLATFORM_ROOT/sony-laptop/battery_care_limiter ]]; then
+    read_num "$PLATFORM_ROOT/sony-laptop/battery_care_limiter"
+    return 0
+  fi
+  if [[ -e $PLATFORM_ROOT/lg-laptop/battery_care_limit ]]; then
+    read_num "$PLATFORM_ROOT/lg-laptop/battery_care_limit"
+    return 0
+  fi
+  if [[ -e $PLATFORM_ROOT/huawei-wmi/charge_control_thresholds ]]; then
+    value=$(tr -s '[:space:]' ' ' <"$PLATFORM_ROOT/huawei-wmi/charge_control_thresholds" | awk '{print $2}')
+    [[ $value =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
+    return 0
+  fi
+  shopt -s nullglob
+  for path in "$IDEAPAD_ROOT"/*/conservation_mode; do
+    value=$(read_num "$path" || true)
+    if [[ $value == 1 ]]; then printf '60\n'; else printf '100\n'; fi
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+cmd=${1:-}
+case "$cmd" in
+get)
+  read_actual
+  ;;
+set)
+  limit=${2:-}
+  valid "$limit" || {
+    echo "battery-charge-limit: limit must be 60, 80, or 100" >&2
+    exit 2
+  }
+  if [[ $(id -u) -ne 0 ]]; then
+    exec pkexec "$0" set "$limit"
+  fi
+  apply_limit "$limit"
+  save_state "$limit"
+  ;;
+apply)
+  if [[ $(id -u) -ne 0 ]]; then
+    exec pkexec "$0" apply
+  fi
+  if [[ -f $STATE ]]; then
+    limit=$(tr -d '[:space:]' <"$STATE")
+  else
+    limit=$(read_actual 2>/dev/null || echo 100)
+  fi
+  valid "$limit" || limit=100
+  apply_limit "$limit"
+  save_state "$limit"
+  ;;
+*)
+  echo "usage: battery-charge-limit get | set <60|80|100> | apply" >&2
+  exit 2
+  ;;
+esac

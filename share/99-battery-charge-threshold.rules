@@ -1,0 +1,4 @@
+# Re-apply the saved charge limit whenever a controllable battery appears.
+ACTION=="add", SUBSYSTEM=="power_supply", TEST=="charge_control_end_threshold", RUN+="/usr/local/bin/battery-charge-limit apply"
+ACTION=="add", SUBSYSTEM=="power_supply", TEST=="charge_stop_threshold", RUN+="/usr/local/bin/battery-charge-limit apply"
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="samsung|sony-laptop|lg-laptop|huawei-wmi", RUN+="/usr/local/bin/battery-charge-limit apply"

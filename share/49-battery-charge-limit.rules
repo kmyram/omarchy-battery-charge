@@ -1,0 +1,9 @@
+// The helper only accepts 60, 80, or 100 and writes kernel charge thresholds.
+// Active local sessions may run it without a password prompt.
+polkit.addRule(function(action, subject) {
+    if (action.id == "com.kmyram.battery-charge-limit" &&
+        subject.local &&
+        subject.active) {
+        return polkit.Result.YES;
+    }
+});

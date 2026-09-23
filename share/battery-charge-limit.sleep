@@ -1,0 +1,6 @@
+#!/bin/bash
+# Restore the charge limit after suspend. Several firmware implementations
+# clear it while the machine is asleep.
+case "${1:-}" in
+post) /usr/local/bin/battery-charge-limit apply ;;
+esac
