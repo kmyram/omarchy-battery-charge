@@ -6,6 +6,8 @@ It uses the kernel charge-threshold interface, so it works on any machine whose 
 
 Some firmware only has a few steps. 60% becomes 50% on Sony, 80% on LG, Toshiba, and Samsung, and IdeaPad conservation mode is a single on/off limit. Dell keeps a 5 point gap, so 60% charges from 55% to 60%.
 
+Older Intel MacBooks use the SMC key `BCLM`. Stock kernels do not expose it. Install [applesmc-next](https://github.com/c---/applesmc-next) (AUR: `applesmc-next-dkms`) and the usual `charge_control_end_threshold` file appears. The plugin also sets `charge_control_full_threshold` two points lower, which is the green charge light. Apple Silicon MacBooks only accept 80% and 100%, so choosing 60% lands on 80%.
+
 ## Install
 
 ```bash
@@ -45,6 +47,8 @@ Nothing to install from the package manager. The plugin needs `bash`, `pkexec`, 
 - `/sys/class/power_supply/*/charge_control_end_threshold`
 - `/sys/class/power_supply/*/charge_stop_threshold`
 - Samsung `battery_life_extender`, Sony `battery_care_limiter`, LG `battery_care_limit`, Huawei `charge_control_thresholds`, or IdeaPad `conservation_mode`
+- Intel MacBooks: `applesmc-next`, which adds `charge_control_end_threshold` and `charge_control_full_threshold`
+- Apple Silicon: `macsmc-battery` from the Asahi kernel, limited to 80% and 100%
 
 ## License
 

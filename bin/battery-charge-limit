@@ -40,10 +40,17 @@ save_state() {
 # before lowering the stop value (ThinkPad and Dell reject start >= stop).
 # Dell and Wilco want start = stop - 5. Full charge is stop 100; start 0
 # means "off" on ThinkPad/Huawei/System76, and 95 is Dell's default.
+#
+# Older Intel MacBooks expose the same stop file through applesmc-next,
+# which writes the SMC key BCLM. charge_control_full_threshold is the green
+# charge LED (BFCL) and must sit at least 2 points under the stop value.
+# Apple Silicon (macsmc-battery) only accepts 80 and 100, so 60 falls back
+# to 80 when 60 does not stick.
 apply_supply() {
   local dir="$1" limit="$2"
-  local end_path="" start_path="" end_target start_now
-  local start_try="" candidate applied=1
+  local end_path="" start_path="" end_target start_now chosen=""
+  local candidate applied=0
+  local -a end_candidates=("$limit")
 
   if [[ -e $dir/charge_control_end_threshold ]]; then
     end_path=$dir/charge_control_end_threshold
@@ -51,6 +58,10 @@ apply_supply() {
     end_path=$dir/charge_stop_threshold
   else
     return 1
+  fi
+
+  if [[ $(basename "$dir") == macsmc-battery && $limit == 60 ]]; then
+    end_candidates=(60 80)
   fi
 
   if [[ -e $dir/charge_control_start_threshold ]]; then
@@ -63,35 +74,52 @@ apply_supply() {
     printf 'Custom\n' >"$dir/charge_type" 2>/dev/null || true
   fi
 
-  end_target=$limit
-  if [[ -n $start_path ]]; then
-    start_now=$(read_num "$start_path" || echo 0)
-    if ((start_now >= end_target)); then
-      for candidate in 0 $((end_target > 5 ? end_target - 5 : 0)) 50; do
-        write_exact "$start_path" "$candidate" && break
-      done
+  for end_target in "${end_candidates[@]}"; do
+    if [[ -n $start_path ]]; then
+      start_now=$(read_num "$start_path" || echo 0)
+      if ((start_now >= end_target)); then
+        for candidate in 0 $((end_target > 5 ? end_target - 5 : 0)) 50; do
+          write_exact "$start_path" "$candidate" && break
+        done
+      fi
     fi
+    if write_exact "$end_path" "$end_target"; then
+      applied=1
+      chosen=$end_target
+      break
+    fi
+  done
+
+  if ((applied != 1)); then
+    return 1
   fi
 
-  write_exact "$end_path" "$end_target" || applied=0
-
-  if [[ -n $start_path && $applied -eq 1 ]]; then
-    if ((end_target >= 100)); then
+  if [[ -n $start_path ]]; then
+    if ((chosen >= 100)); then
       for candidate in 0 95; do
         write_exact "$start_path" "$candidate" && break
       done
     else
-      for candidate in $((end_target - 5)) $((end_target - 10)) 0; do
-        ((candidate >= 0 && candidate < end_target)) || continue
+      for candidate in $((chosen - 5)) $((chosen - 10)) 0; do
+        ((candidate >= 0 && candidate < chosen)) || continue
         write_exact "$start_path" "$candidate" && break
       done
     fi
   fi
 
-  if ((applied == 1)); then
-    return 0
+  if [[ -e $dir/charge_control_full_threshold ]]; then
+    if ((chosen >= 100)); then
+      write_exact "$dir/charge_control_full_threshold" 100 \
+        || write_exact "$dir/charge_control_full_threshold" 98 \
+        || true
+    else
+      candidate=$((chosen - 2))
+      ((candidate < 1)) && candidate=1
+      write_exact "$dir/charge_control_full_threshold" "$candidate" || true
+    fi
   fi
-  return 1
+
+  return 0
 }
 
 # Fixed-step vendor interfaces used when the standard attribute is absent.

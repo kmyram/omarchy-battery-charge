@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kmyram.battery-charge",
   "name": "Battery charge limit",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Kasper Myram",
   "license": "MIT",
   "description": "Switch the battery charge limit between 60, 80, and 100 percent on laptops whose kernel exposes a charge threshold.",
